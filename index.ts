@@ -24,6 +24,8 @@ import { Agent } from "http";
 import { Agent as HttpsAgent } from "https";
 import { URL } from "url";
 import { InMemoryEventStore } from "./src/inMemoryEventStore.js";
+import { configManager, DynamicConfigSchema } from "./src/dynamicGitLabConfig.js";
+import { sessionClientManager } from "./src/sessionAwareGitLabClient.js";
 
 import {
   GitLabForkSchema,
@@ -4324,7 +4326,7 @@ async function runServer() {
     // Server startup banner removed - inappropriate use of console.error for logging
     
     if (STREAMABLE_HTTP) {
-      // 使用 Streamable HTTP 协议
+      // 使用 Streamable HTTP 协议 - 支持多租户动态配置
       const app = express();
       app.use(express.json());
       
@@ -4333,52 +4335,107 @@ async function runServer() {
 
       app.post("/mcp", async (req: Request, res: Response) => {
         console.log("Received MCP request:", req.body);
+        console.log("Query parameters:", req.query);
+        
         try {
           // 检查是否存在 session ID
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
           let transport: StreamableHTTPServerTransport;
 
           if (sessionId && transports[sessionId]) {
-            // 重用现有的 transport
+            // 重用现有的 transport - 验证会话仍然有效
             transport = transports[sessionId];
+            const sessionConfig = configManager.getSessionConfig(sessionId);
+            if (!sessionConfig) {
+              // 会话已过期，清理 transport
+              delete transports[sessionId];
+              sessionClientManager.removeClient(sessionId);
+              res.status(401).json({
+                jsonrpc: "2.0",
+                error: {
+                  code: -32001,
+                  message: "Session expired. Please reconnect with valid parameters.",
+                },
+                id: null,
+              });
+              return;
+            }
           } else if (!sessionId && isInitializeRequest(req.body)) {
-            // 新的初始化请求
-            const eventStore = new InMemoryEventStore();
-            transport = new StreamableHTTPServerTransport({
-              sessionIdGenerator: () => randomUUID(),
-              eventStore, // 启用可恢复性
-              onsessioninitialized: (sessionId) => {
-                // 当 session 初始化时，按 session ID 存储 transport
-                // 这避免了在 session 存储之前可能发生的请求竞争条件
-                console.log(`Session initialized with ID: ${sessionId}`);
-                transports[sessionId] = transport;
-              },
-            });
+            // 新的初始化请求 - 支持从 URL 参数获取配置
+            try {
+              // 解析查询参数并创建会话配置
+              const tempSessionId = randomUUID();
+              const sessionConfig = configManager.createSessionConfig(tempSessionId, req.query);
+              
+              // 创建会话感知的 GitLab 客户端
+              const gitlabClient = sessionClientManager.getClient(sessionConfig);
+              
+              console.log(`Created new session ${tempSessionId} with config:`, {
+                api_url: sessionConfig.config.api_url,
+                has_token: !!sessionConfig.config.access_token,
+                project_id: sessionConfig.config.project_id,
+                read_only: sessionConfig.config.read_only,
+              });
 
-            // 设置 onclose 处理程序以在关闭时清理 transport
-            transport.onclose = () => {
-              const sid = transport.sessionId;
-              if (sid && transports[sid]) {
-                console.log(
-                  `Transport closed for session ${sid}, removing from transports map`,
-                );
-                delete transports[sid];
-              }
-            };
+              const eventStore = new InMemoryEventStore();
+              transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => tempSessionId,
+                eventStore, // 启用可恢复性
+                onsessioninitialized: (actualSessionId) => {
+                  // 当 session 初始化时，按 session ID 存储 transport
+                  console.log(`Session initialized with ID: ${actualSessionId}`);
+                  transports[actualSessionId] = transport;
+                  
+                  // 如果实际的 session ID 与临时 ID 不同，需要更新配置
+                  if (actualSessionId !== tempSessionId) {
+                    const config = configManager.getSessionConfig(tempSessionId);
+                    if (config) {
+                      configManager.removeSessionConfig(tempSessionId);
+                      sessionClientManager.removeClient(tempSessionId);
+                      
+                      // 用新的 session ID 重新创建配置
+                      const newConfig = configManager.createSessionConfig(actualSessionId, req.query);
+                      sessionClientManager.getClient(newConfig);
+                    }
+                  }
+                },
+              });
 
-            // 在处理请求之前将 transport 连接到 MCP 服务器
-            // 这样响应可以流回同一个 transport
-            await server.connect(transport);
+              // 设置 onclose 处理程序以在关闭时清理 transport
+              transport.onclose = () => {
+                const sid = transport.sessionId;
+                if (sid && transports[sid]) {
+                  console.log(`Transport closed for session ${sid}, cleaning up`);
+                  delete transports[sid];
+                  configManager.removeSessionConfig(sid);
+                  sessionClientManager.removeClient(sid);
+                }
+              };
 
-            await transport.handleRequest(req, res, req.body);
-            return; // 已经处理
+              // 在处理请求之前将 transport 连接到 MCP 服务器
+              await server.connect(transport);
+              await transport.handleRequest(req, res, req.body);
+              return; // 已经处理
+              
+            } catch (configError) {
+              console.error("Configuration error:", configError);
+              res.status(400).json({
+                jsonrpc: "2.0",
+                error: {
+                  code: -32002,
+                  message: `Configuration error: ${configError instanceof Error ? configError.message : String(configError)}`,
+                },
+                id: null,
+              });
+              return;
+            }
           } else {
             // 无效请求 - 没有 session ID 或不是初始化请求
             res.status(400).json({
               jsonrpc: "2.0",
               error: {
                 code: -32000,
-                message: "Bad Request: No valid session ID provided",
+                message: "Bad Request: No valid session ID provided or missing required parameters (api_url, access_token)",
               },
               id: null,
             });
@@ -4386,7 +4443,6 @@ async function runServer() {
           }
 
           // 使用现有的 transport 处理请求 - 不需要重新连接
-          // 现有的 transport 已经连接到服务器
           await transport.handleRequest(req, res, req.body);
         } catch (error) {
           console.error("Error handling MCP request:", error);
@@ -4394,6 +4450,47 @@ async function runServer() {
             res.status(500).send("Internal server error");
           }
         }
+      });
+
+      // 健康检查端点
+      app.get("/health", (req: Request, res: Response) => {
+        const stats = configManager.getStats();
+        const clientStats = {
+          activeClients: sessionClientManager.getActiveClientCount(),
+        };
+        
+        res.json({
+          status: "healthy",
+          timestamp: new Date().toISOString(),
+          mode: "streamable-http",
+          sessions: stats,
+          clients: clientStats,
+        });
+      });
+
+      // 配置状态端点
+      app.get("/status", (req: Request, res: Response) => {
+        const stats = configManager.getStats();
+        const clientStats = {
+          activeClients: sessionClientManager.getActiveClientCount(),
+        };
+        
+        res.json({
+          server: {
+            mode: "streamable-http",
+            port: PORT,
+            startTime: new Date().toISOString(),
+          },
+          sessions: stats,
+          clients: clientStats,
+          usage: {
+            description: "Connect with: POST /mcp?api_url=<gitlab_url>&access_token=<token>&project_id=<id>&read_only=true",
+            parameters: {
+              required: ["api_url", "access_token"],
+              optional: ["project_id", "read_only", "use_wiki", "use_milestone", "use_pipeline"],
+            },
+          },
+        });
       });
 
       // 可重用的 GET 和 DELETE 请求处理程序
