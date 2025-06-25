@@ -3,7 +3,8 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import nodeFetch from "node-fetch";
 import fetchCookie from "fetch-cookie";
 import { CookieJar, parse as parseCookie } from "tough-cookie";
@@ -17,10 +18,12 @@ import { dirname } from "path";
 import fs from "fs";
 import path from "path";
 import express, { Request, Response } from "express";
+import { randomUUID } from "node:crypto";
 // Add type imports for proxy agents
 import { Agent } from "http";
 import { Agent as HttpsAgent } from "https";
 import { URL } from "url";
+import { InMemoryEventStore } from "./src/inMemoryEventStore.js";
 
 import {
   GitLabForkSchema,
@@ -219,6 +222,7 @@ const USE_GITLAB_WIKI = process.env.USE_GITLAB_WIKI === "true";
 const USE_MILESTONE = process.env.USE_MILESTONE === "true";
 const USE_PIPELINE = process.env.USE_PIPELINE === "true";
 const SSE = process.env.SSE === "true";
+const STREAMABLE_HTTP = process.env.STREAMABLE_HTTP === "true";
 
 // Add proxy configuration
 const HTTP_PROXY = process.env.HTTP_PROXY;
@@ -4318,7 +4322,133 @@ async function runServer() {
     // Server version banner removed - inappropriate use of console.error for logging
     // API URL banner removed - inappropriate use of console.error for logging
     // Server startup banner removed - inappropriate use of console.error for logging
-    if (!SSE) {
+    
+    if (STREAMABLE_HTTP) {
+      // 使用 Streamable HTTP 协议
+      const app = express();
+      app.use(express.json());
+      
+      // 按 session ID 存储 transports
+      const transports: { [sessionId: string]: StreamableHTTPServerTransport } = {};
+
+      app.post("/mcp", async (req: Request, res: Response) => {
+        console.log("Received MCP request:", req.body);
+        try {
+          // 检查是否存在 session ID
+          const sessionId = req.headers["mcp-session-id"] as string | undefined;
+          let transport: StreamableHTTPServerTransport;
+
+          if (sessionId && transports[sessionId]) {
+            // 重用现有的 transport
+            transport = transports[sessionId];
+          } else if (!sessionId && isInitializeRequest(req.body)) {
+            // 新的初始化请求
+            const eventStore = new InMemoryEventStore();
+            transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              eventStore, // 启用可恢复性
+              onsessioninitialized: (sessionId) => {
+                // 当 session 初始化时，按 session ID 存储 transport
+                // 这避免了在 session 存储之前可能发生的请求竞争条件
+                console.log(`Session initialized with ID: ${sessionId}`);
+                transports[sessionId] = transport;
+              },
+            });
+
+            // 设置 onclose 处理程序以在关闭时清理 transport
+            transport.onclose = () => {
+              const sid = transport.sessionId;
+              if (sid && transports[sid]) {
+                console.log(
+                  `Transport closed for session ${sid}, removing from transports map`,
+                );
+                delete transports[sid];
+              }
+            };
+
+            // 在处理请求之前将 transport 连接到 MCP 服务器
+            // 这样响应可以流回同一个 transport
+            await server.connect(transport);
+
+            await transport.handleRequest(req, res, req.body);
+            return; // 已经处理
+          } else {
+            // 无效请求 - 没有 session ID 或不是初始化请求
+            res.status(400).json({
+              jsonrpc: "2.0",
+              error: {
+                code: -32000,
+                message: "Bad Request: No valid session ID provided",
+              },
+              id: null,
+            });
+            return;
+          }
+
+          // 使用现有的 transport 处理请求 - 不需要重新连接
+          // 现有的 transport 已经连接到服务器
+          await transport.handleRequest(req, res, req.body);
+        } catch (error) {
+          console.error("Error handling MCP request:", error);
+          if (!res.headersSent) {
+            res.status(500).send("Internal server error");
+          }
+        }
+      });
+
+      // 可重用的 GET 和 DELETE 请求处理程序
+      const handleSessionRequest = async (
+        req: Request,
+        res: Response,
+      ) => {
+        const sessionId = req.headers["mcp-session-id"] as string | undefined;
+        if (!sessionId || !transports[sessionId]) {
+          res.status(400).send("Invalid or missing session ID");
+          return;
+        }
+
+        const transport = transports[sessionId];
+        await transport.handleRequest(req, res);
+      };
+
+      // 处理通过 SSE 从服务器到客户端的通知的 GET 请求
+      app.get("/mcp", handleSessionRequest);
+
+      // 处理终止会话的 DELETE 请求
+      app.delete("/mcp", handleSessionRequest);
+
+      app.get("/health", (_: Request, res: Response) => {
+        res.status(200).json({
+          status: "healthy",
+          version: process.env.npm_package_version || "unknown",
+          protocol: "streamable-http",
+        });
+      });
+
+      const PORT = process.env.PORT || 3002;
+      app.listen(PORT, () => {
+        console.log(`GitLab MCP Server listening on port ${PORT} (Streamable HTTP)`);
+      });
+
+      // 处理服务器关闭
+      process.on("SIGINT", async () => {
+        console.log("Shutting down server...");
+
+        // 关闭所有活跃的 transports 以清理资源
+        for (const sessionId in transports) {
+          try {
+            console.log(`Closing transport for session ${sessionId}`);
+            await transports[sessionId].close();
+            delete transports[sessionId];
+          } catch (error) {
+            console.error(`Error closing transport for session ${sessionId}:`, error);
+          }
+        }
+        console.log("Server shutdown complete");
+        process.exit(0);
+      });
+
+    } else if (!SSE) {
       const transport = new StdioServerTransport();
       await server.connect(transport);
     } else {
