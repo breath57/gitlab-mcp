@@ -24,6 +24,7 @@ import { Agent } from "http";
 import { Agent as HttpsAgent } from "https";
 import { URL } from "url";
 import { InMemoryEventStore } from "./src/inMemoryEventStore.js";
+import { AsyncLocalStorage } from "async_hooks";
 
 import {
   GitLabForkSchema,
@@ -309,6 +310,33 @@ const createCookieJar = (): CookieJar | null => {
 const cookieJar = createCookieJar();
 const fetch = cookieJar ? fetchCookie(nodeFetch, cookieJar) : nodeFetch;
 
+// 创建AsyncLocalStorage来跟踪当前请求的access_token
+const accessTokenStorage = new AsyncLocalStorage<string>();
+
+// 存储每个会话的access_token
+const sessionAccessTokens: { [sessionId: string]: string } = {};
+
+// 当前请求的access_token (使用AsyncLocalStorage来跟踪当前请求上下文)
+let currentAccessToken: string | undefined;
+
+// 设置当前请求的access_token
+function setCurrentAccessToken(token: string) {
+  currentAccessToken = token;
+}
+
+// 获取当前请求的access_token
+function getCurrentAccessToken(): string {
+  // 优先使用AsyncLocalStorage中的token
+  const storageToken = accessTokenStorage.getStore();
+  return storageToken || currentAccessToken || GITLAB_PERSONAL_ACCESS_TOKEN || "";
+}
+
+// 从URL参数或环境变量获取access_token
+function getAccessTokenFromRequestOrEnv(req: Request): string {
+  const urlAccessToken = req.query.access_token as string;
+  return urlAccessToken || GITLAB_PERSONAL_ACCESS_TOKEN || "";
+}
+
 // Ensure session is established for the current request
 async function ensureSessionForRequest(): Promise<void> {
   if (!cookieJar || !GITLAB_AUTH_COOKIE_PATH) return;
@@ -327,7 +355,7 @@ async function ensureSessionForRequest(): Promise<void> {
     try {
       // Establish session with a lightweight request
       await fetch(`${GITLAB_API_URL}/user`, {
-        ...DEFAULT_FETCH_CONFIG,
+        ...createFetchConfig(),
         redirect: 'follow'
       }).catch(() => {
         // Ignore errors - the important thing is that cookies get set during redirects
@@ -339,6 +367,38 @@ async function ensureSessionForRequest(): Promise<void> {
       // Ignore session establishment errors
     }
   }
+}
+
+// 创建动态headers，支持传入的access_token
+function createHeaders(accessToken?: string): Record<string, string> {
+  const token = accessToken || getCurrentAccessToken();
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+  
+  if (token) {
+    if (IS_OLD) {
+      headers["Private-Token"] = `${token}`;
+    } else {
+      headers["Authorization"] = `Bearer ${token}`;
+    }
+  }
+  
+  return headers;
+}
+
+// 创建动态fetch配置，支持传入的access_token
+function createFetchConfig(accessToken?: string) {
+  return {
+    headers: createHeaders(accessToken),
+    agent: (parsedUrl: URL) => {
+      if (parsedUrl.protocol === "https:") {
+        return httpsAgent;
+      }
+      return httpAgent;
+    },
+  };
 }
 
 // Modify DEFAULT_HEADERS to include agent configuration
@@ -353,15 +413,15 @@ if (IS_OLD) {
 }
 
 // Create a default fetch configuration object that includes proxy agents if set
-const DEFAULT_FETCH_CONFIG = {
-  headers: DEFAULT_HEADERS,
-  agent: (parsedUrl: URL) => {
-    if (parsedUrl.protocol === "https:") {
-      return httpsAgent;
-    }
-    return httpAgent;
-  },
-};
+// const DEFAULT_FETCH_CONFIG = {
+//   headers: DEFAULT_HEADERS,
+//   agent: (parsedUrl: URL) => {
+//     if (parsedUrl.protocol === "https:") {
+//       return httpsAgent;
+//     }
+//     return httpAgent;
+//   },
+// };
 
 // Define all available tools
 const allTools = [
@@ -871,7 +931,7 @@ async function forkProject(projectId: string, namespace?: string): Promise<GitLa
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
   });
 
@@ -904,7 +964,7 @@ async function createBranch(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({
       branch: options.name,
@@ -929,7 +989,7 @@ async function getDefaultBranchRef(projectId: string): Promise<string> {
   const url = new URL(`${GITLAB_API_URL}/projects/${encodeURIComponent(effectiveProjectId)}`);
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -967,7 +1027,7 @@ async function getFileContents(
   url.searchParams.append("ref", ref);
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   // 파일을 찾을 수 없는 경우 처리
@@ -1005,7 +1065,7 @@ async function createIssue(
   const url = new URL(`${GITLAB_API_URL}/projects/${encodeURIComponent(effectiveProjectId)}/issues`);
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({
       title: options.title,
@@ -1063,7 +1123,7 @@ async function listIssues(
   });
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -1098,7 +1158,7 @@ async function listMergeRequests(
   });
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -1121,7 +1181,7 @@ async function getIssue(projectId: string, issueIid: number): Promise<GitLabIssu
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -1155,7 +1215,7 @@ async function updateIssue(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "PUT",
     body: JSON.stringify(body),
   });
@@ -1180,7 +1240,7 @@ async function deleteIssue(projectId: string, issueIid: number): Promise<void> {
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "DELETE",
   });
 
@@ -1205,7 +1265,7 @@ async function listIssueLinks(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -1235,7 +1295,7 @@ async function getIssueLink(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -1268,7 +1328,7 @@ async function createIssueLink(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({
       target_project_id: targetProjectId,
@@ -1304,7 +1364,7 @@ async function deleteIssueLink(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "DELETE",
   });
 
@@ -1327,7 +1387,7 @@ async function createMergeRequest(
   const url = new URL(`${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/merge_requests`);
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({
       title: options.title,
@@ -1390,7 +1450,7 @@ async function listDiscussions(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -1489,7 +1549,7 @@ async function updateMergeRequestNote(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "PUT",
     body: JSON.stringify(payload),
   });
@@ -1525,7 +1585,7 @@ async function updateIssueNote(
   const payload = { body };
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "PUT",
     body: JSON.stringify(payload),
   });
@@ -1564,7 +1624,7 @@ async function createIssueNote(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -1605,7 +1665,7 @@ async function createMergeRequestNote(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -1688,7 +1748,7 @@ async function createOrUpdateFile(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method,
     body: JSON.stringify(body),
   });
@@ -1726,7 +1786,7 @@ async function createTree(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({
       files: files.map(file => ({
@@ -1773,7 +1833,7 @@ async function createCommit(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({
       branch,
@@ -1823,7 +1883,7 @@ async function searchProjects(
   url.searchParams.append("sort", "desc");
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   if (!response.ok) {
@@ -1857,7 +1917,7 @@ async function createRepository(
   options: z.infer<typeof CreateRepositoryOptionsSchema>
 ): Promise<GitLabRepository> {
   const response = await fetch(`${GITLAB_API_URL}/projects`, {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({
       name: options.name,
@@ -1912,7 +1972,7 @@ async function getMergeRequest(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -1964,7 +2024,7 @@ async function getMergeRequestDiffs(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2019,7 +2079,7 @@ async function listMergeRequestDiffs(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2055,7 +2115,7 @@ async function getBranchDiffs(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   if (!response.ok) {
@@ -2101,7 +2161,7 @@ async function updateMergeRequest(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "PUT",
     body: JSON.stringify(options),
   });
@@ -2136,7 +2196,7 @@ async function createNote(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify({ body }),
   });
@@ -2192,7 +2252,7 @@ async function createMergeRequestThread(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -2232,7 +2292,7 @@ async function listNamespaces(options: {
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2251,7 +2311,7 @@ async function getNamespace(id: string): Promise<GitLabNamespace> {
   const url = new URL(`${GITLAB_API_URL}/namespaces/${encodeURIComponent(id)}`);
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2278,7 +2338,7 @@ async function verifyNamespaceExistence(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2321,7 +2381,7 @@ async function getProject(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2353,7 +2413,7 @@ async function listProjects(
 
   // Make the API request
   const response = await fetch(`${GITLAB_API_URL}/projects?${params.toString()}`, {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   // Handle errors
@@ -2392,7 +2452,7 @@ async function listLabels(
 
   // Make the API request
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   // Handle errors
@@ -2430,7 +2490,7 @@ async function getLabel(
 
   // Make the API request
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   // Handle errors
@@ -2457,7 +2517,7 @@ async function createLabel(
   const response = await fetch(
     `${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/labels`,
     {
-      ...DEFAULT_FETCH_CONFIG,
+      ...createFetchConfig(),
       method: "POST",
       body: JSON.stringify(options),
     }
@@ -2491,7 +2551,7 @@ async function updateLabel(
       getEffectiveProjectId(projectId)
     )}/labels/${encodeURIComponent(String(labelId))}`,
     {
-      ...DEFAULT_FETCH_CONFIG,
+      ...createFetchConfig(),
       method: "PUT",
       body: JSON.stringify(options),
     }
@@ -2519,7 +2579,7 @@ async function deleteLabel(projectId: string, labelId: number | string): Promise
       getEffectiveProjectId(projectId)
     )}/labels/${encodeURIComponent(String(labelId))}`,
     {
-      ...DEFAULT_FETCH_CONFIG,
+      ...createFetchConfig(),
       method: "DELETE",
     }
   );
@@ -2569,7 +2629,7 @@ async function listGroupProjects(
     url.searchParams.append("with_security_reports", options.with_security_reports.toString());
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2592,7 +2652,7 @@ async function listWikiPages(
   if (options.with_content)
     url.searchParams.append("with_content", options.with_content.toString());
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
   await handleGitLabError(response);
   const data = await response.json();
@@ -2606,7 +2666,7 @@ async function getWikiPage(projectId: string, slug: string): Promise<GitLabWikiP
   projectId = decodeURIComponent(projectId); // Decode project ID
   const response = await fetch(
     `${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/wikis/${encodeURIComponent(slug)}`,
-    { ...DEFAULT_FETCH_CONFIG }
+    { ...createFetchConfig() }
   );
   await handleGitLabError(response);
   const data = await response.json();
@@ -2628,7 +2688,7 @@ async function createWikiPage(
   const response = await fetch(
     `${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/wikis`,
     {
-      ...DEFAULT_FETCH_CONFIG,
+      ...createFetchConfig(),
       method: "POST",
       body: JSON.stringify(body),
     }
@@ -2656,7 +2716,7 @@ async function updateWikiPage(
   const response = await fetch(
     `${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/wikis/${encodeURIComponent(slug)}`,
     {
-      ...DEFAULT_FETCH_CONFIG,
+      ...createFetchConfig(),
       method: "PUT",
       body: JSON.stringify(body),
     }
@@ -2674,7 +2734,7 @@ async function deleteWikiPage(projectId: string, slug: string): Promise<void> {
   const response = await fetch(
     `${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/wikis/${encodeURIComponent(slug)}`,
     {
-      ...DEFAULT_FETCH_CONFIG,
+      ...createFetchConfig(),
       method: "DELETE",
     }
   );
@@ -2703,7 +2763,7 @@ async function listPipelines(
   });
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -2725,7 +2785,7 @@ async function getPipeline(projectId: string, pipelineId: number): Promise<GitLa
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   if (response.status === 404) {
@@ -2767,7 +2827,7 @@ async function listPipelineJobs(
   });
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   if (response.status === 404) {
@@ -2783,7 +2843,7 @@ async function getPipelineJob(projectId: string, jobId: number): Promise<GitLabP
   const url = new URL(`${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/jobs/${jobId}`);
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   if (response.status === 404) {
@@ -2811,7 +2871,7 @@ async function getPipelineJobOutput(projectId: string, jobId: number, limit?: nu
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     headers: {
       ...DEFAULT_HEADERS,
       Accept: "text/plain", // Override Accept header to get plain text
@@ -2883,7 +2943,7 @@ async function createPipeline(
 
   const response = await fetch(url.toString(), {
     method: "POST",
-    headers: DEFAULT_HEADERS,
+    headers: createHeaders(),
     body: JSON.stringify(body),
   });
 
@@ -2907,7 +2967,7 @@ async function retryPipeline(projectId: string, pipelineId: number): Promise<Git
 
   const response = await fetch(url.toString(), {
     method: "POST",
-    headers: DEFAULT_HEADERS,
+    headers: createHeaders(),
   });
 
   await handleGitLabError(response);
@@ -2930,7 +2990,7 @@ async function cancelPipeline(projectId: string, pipelineId: number): Promise<Gi
 
   const response = await fetch(url.toString(), {
     method: "POST",
-    headers: DEFAULT_HEADERS,
+    headers: createHeaders(),
   });
 
   await handleGitLabError(response);
@@ -3009,7 +3069,7 @@ async function listProjectMilestones(
   });
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
   await handleGitLabError(response);
   const data = await response.json();
@@ -3032,7 +3092,7 @@ async function getProjectMilestone(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
   await handleGitLabError(response);
   const data = await response.json();
@@ -3053,7 +3113,7 @@ async function createProjectMilestone(
   const url = new URL(`${GITLAB_API_URL}/projects/${encodeURIComponent(getEffectiveProjectId(projectId))}/milestones`);
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
     body: JSON.stringify(options),
   });
@@ -3080,7 +3140,7 @@ async function editProjectMilestone(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "PUT",
     body: JSON.stringify(options),
   });
@@ -3102,7 +3162,7 @@ async function deleteProjectMilestone(projectId: string, milestoneId: number): P
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "DELETE",
   });
   await handleGitLabError(response);
@@ -3121,7 +3181,7 @@ async function getMilestoneIssues(projectId: string, milestoneId: number): Promi
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
   await handleGitLabError(response);
   const data = await response.json();
@@ -3146,7 +3206,7 @@ async function getMilestoneMergeRequests(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
   await handleGitLabError(response);
   const data = await response.json();
@@ -3169,7 +3229,7 @@ async function promoteProjectMilestone(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
     method: "POST",
   });
   await handleGitLabError(response);
@@ -3192,7 +3252,7 @@ async function getMilestoneBurndownEvents(projectId: string, milestoneId: number
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
   await handleGitLabError(response);
   const data = await response.json();
@@ -3211,7 +3271,7 @@ async function getUser(username: string): Promise<GitLabUser | null> {
     url.searchParams.append("username", username);
 
     const response = await fetch(url.toString(), {
-      ...DEFAULT_FETCH_CONFIG,
+      ...createFetchConfig(),
     });
 
     await handleGitLabError(response);
@@ -3290,7 +3350,7 @@ async function listCommits(
   if (options.per_page) url.searchParams.append("per_page", options.per_page.toString());
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -3323,7 +3383,7 @@ async function getCommit(
   }
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -3350,7 +3410,7 @@ async function getCommitDiff(
   );
 
   const response = await fetch(url.toString(), {
-    ...DEFAULT_FETCH_CONFIG,
+    ...createFetchConfig(),
   });
 
   await handleGitLabError(response);
@@ -3685,7 +3745,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
         }
 
         const response = await fetch(url.toString(), {
-          ...DEFAULT_FETCH_CONFIG,
+          ...createFetchConfig(),
         });
 
         await handleGitLabError(response);
@@ -3704,7 +3764,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
         );
 
         const response = await fetch(url.toString(), {
-          ...DEFAULT_FETCH_CONFIG,
+          ...createFetchConfig(),
         });
 
         await handleGitLabError(response);
@@ -3721,7 +3781,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
         const url = new URL(`${GITLAB_API_URL}/namespaces/${encodeURIComponent(args.path)}/exists`);
 
         const response = await fetch(url.toString(), {
-          ...DEFAULT_FETCH_CONFIG,
+          ...createFetchConfig(),
         });
 
         await handleGitLabError(response);
@@ -3738,7 +3798,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
         const url = new URL(`${GITLAB_API_URL}/projects/${encodeURIComponent(args.project_id)}`);
 
         const response = await fetch(url.toString(), {
-          ...DEFAULT_FETCH_CONFIG,
+          ...createFetchConfig(),
         });
 
         await handleGitLabError(response);
@@ -4314,7 +4374,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
 /**
  * Initialize and run the server
- * 서버 초기화 및 실행
+ * 服务器 初始化 及 运行
  */
 async function runServer() {
   try {
@@ -4334,6 +4394,9 @@ async function runServer() {
       app.post("/mcp", async (req: Request, res: Response) => {
         console.log("Received MCP request:", req.body);
         try {
+          // 从URL参数获取access_token
+          const accessToken = getAccessTokenFromRequestOrEnv(req);
+          
           // 检查是否存在 session ID
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
           let transport: StreamableHTTPServerTransport;
@@ -4341,6 +4404,12 @@ async function runServer() {
           if (sessionId && transports[sessionId]) {
             // 重用现有的 transport
             transport = transports[sessionId];
+            // 使用AsyncLocalStorage运行后续的处理，确保在所有工具调用中都能获取到正确的access_token
+            const tokenToUse = sessionAccessTokens[sessionId] || accessToken;
+            await accessTokenStorage.run(tokenToUse, async () => {
+              await transport.handleRequest(req, res, req.body);
+            });
+            return;
           } else if (!sessionId && isInitializeRequest(req.body)) {
             // 新的初始化请求
             const eventStore = new InMemoryEventStore();
@@ -4352,6 +4421,8 @@ async function runServer() {
                 // 这避免了在 session 存储之前可能发生的请求竞争条件
                 console.log(`Session initialized with ID: ${sessionId}`);
                 transports[sessionId] = transport;
+                // 存储该会话的access_token
+                sessionAccessTokens[sessionId] = accessToken;
               },
             });
 
@@ -4363,6 +4434,8 @@ async function runServer() {
                   `Transport closed for session ${sid}, removing from transports map`,
                 );
                 delete transports[sid];
+                // 清理该会话的access_token
+                delete sessionAccessTokens[sid];
               }
             };
 
@@ -4370,24 +4443,43 @@ async function runServer() {
             // 这样响应可以流回同一个 transport
             await server.connect(transport);
 
-            await transport.handleRequest(req, res, req.body);
+            // 使用AsyncLocalStorage运行初始化处理
+            await accessTokenStorage.run(accessToken, async () => {
+              await transport.handleRequest(req, res, req.body);
+            });
             return; // 已经处理
           } else {
-            // 无效请求 - 没有 session ID 或不是初始化请求
-            res.status(400).json({
-              jsonrpc: "2.0",
-              error: {
-                code: -32000,
-                message: "Bad Request: No valid session ID provided",
+            // 处理没有session ID但不是初始化请求的情况
+            // 这可能是第一次调用工具方法，我们需要创建一个新的session
+            console.log("No session ID and not initialize request, creating new session...");
+            const eventStore = new InMemoryEventStore();
+            transport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              eventStore,
+              onsessioninitialized: (sessionId) => {
+                console.log(`Session initialized with ID: ${sessionId}`);
+                transports[sessionId] = transport;
+                sessionAccessTokens[sessionId] = accessToken;
               },
-              id: null,
+            });
+
+            transport.onclose = () => {
+              const sid = transport.sessionId;
+              if (sid && transports[sid]) {
+                console.log(`Transport closed for session ${sid}, removing from transports map`);
+                delete transports[sid];
+                delete sessionAccessTokens[sid];
+              }
+            };
+
+            await server.connect(transport);
+            
+            await accessTokenStorage.run(accessToken, async () => {
+              await transport.handleRequest(req, res, req.body);
             });
             return;
           }
 
-          // 使用现有的 transport 处理请求 - 不需要重新连接
-          // 现有的 transport 已经连接到服务器
-          await transport.handleRequest(req, res, req.body);
         } catch (error) {
           console.error("Error handling MCP request:", error);
           if (!res.headersSent) {
