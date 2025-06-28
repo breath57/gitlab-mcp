@@ -402,15 +402,15 @@ function createFetchConfig(accessToken?: string) {
 }
 
 // Modify DEFAULT_HEADERS to include agent configuration
-const DEFAULT_HEADERS: Record<string, string> = {
-  Accept: "application/json",
-  "Content-Type": "application/json",
-};
-if (IS_OLD) {
-  DEFAULT_HEADERS["Private-Token"] = `${GITLAB_PERSONAL_ACCESS_TOKEN}`;
-} else {
-  DEFAULT_HEADERS["Authorization"] = `Bearer ${GITLAB_PERSONAL_ACCESS_TOKEN}`;
-}
+// const DEFAULT_HEADERS: Record<string, string> = {
+//   Accept: "application/json",
+//   "Content-Type": "application/json",
+// };
+// if (IS_OLD) {
+//   DEFAULT_HEADERS["Private-Token"] = `${GITLAB_PERSONAL_ACCESS_TOKEN}`;
+// } else {
+//   DEFAULT_HEADERS["Authorization"] = `Bearer ${GITLAB_PERSONAL_ACCESS_TOKEN}`;
+// }
 
 // Create a default fetch configuration object that includes proxy agents if set
 // const DEFAULT_FETCH_CONFIG = {
@@ -2873,7 +2873,7 @@ async function getPipelineJobOutput(projectId: string, jobId: number, limit?: nu
   const response = await fetch(url.toString(), {
     ...createFetchConfig(),
     headers: {
-      ...DEFAULT_HEADERS,
+      ...createHeaders(),
       Accept: "text/plain", // Override Accept header to get plain text
     },
   });
@@ -3014,20 +3014,17 @@ async function getRepositoryTree(options: GetRepositoryTreeOptions): Promise<Git
   if (options.page_token) queryParams.append("page_token", options.page_token);
   if (options.pagination) queryParams.append("pagination", options.pagination);
 
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (IS_OLD) {
-    headers["Private-Token"] = `${GITLAB_PERSONAL_ACCESS_TOKEN}`;
-  } else {
-    headers["Authorization"] = `Bearer ${GITLAB_PERSONAL_ACCESS_TOKEN}`;
-  }
+ 
+  // 打印实际请求的url
+  console.log(`[DEBUG] getRepositoryTree 这是实际请求的url: ${GITLAB_API_URL}/projects/${encodeURIComponent(
+    options.project_id
+  )}/repository/tree?${queryParams.toString()}`);
   const response = await fetch(
     `${GITLAB_API_URL}/projects/${encodeURIComponent(
       options.project_id
     )}/repository/tree?${queryParams.toString()}`,
     {
-      headers,
+      headers: createHeaders(),
     }
   );
 
